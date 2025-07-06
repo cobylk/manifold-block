@@ -1,0 +1,87 @@
+\section{Architecture}
+\subsection{Atlas Autoencoder}
+
+\begin{definition}[Atlas]\label{def:atlas}
+    Let $x$ be a data point on a $d$-dimensional manifold $M \subset \mathbb{R}^D$.  
+    A chart $C_i$ is a diffeomorphism 
+    $C_i : \mathbb{R}^d \longrightarrow M$.  
+    The finite family $\{C_i\}_{i=1}^m$ is the \emph{atlas}.
+\end{definition}
+
+Our block is a \textit{mixture-of-autoencoders}.  We learn  
+\begin{enumerate}
+    \item A shared gating network $g : \mathbb{R}^D \!\longrightarrow\! \mathbb{R}^m$ producing logits $z_i = g_i(x)$.  
+          Soft-max yields soft chart weights $\alpha_i = \operatorname{softmax}(z)_i$. 
+    \item For every chart $i$ a pair of MLPs  
+          \[
+              C_i : \mathbb{R}^d \longrightarrow M, \qquad 
+              C_i(\xi) = \sigma\!\bigl(W_{C_i}\xi + b_{C_i}\bigr),
+          \]
+          \[
+              D_i : M \longrightarrow \mathbb{R}^d, \qquad 
+              D_i(x) = \sigma\!\bigl(W_{D_i}x + b_{D_i}\bigr),
+          \]
+          with $C_i^{-1} \approx D_i$ and $\sigma$ the ReLU.
+\end{enumerate}
+
+For each chart we reconstruct
+\begin{align*}
+    \xi_i &= D_i(x),\\
+    \hat{x}_i &= C_i(\xi_i),
+\end{align*}
+then recombine
+\[
+    \hat{x} \;=\; \sum_{i=1}^m \alpha_i\,\hat{x}_i.
+\]
+
+The loss is
+\[
+    \mathcal{L}_\mathrm{rec}= \lVert \hat{x}-x \rVert_2^2, \qquad
+    \mathcal{L}_\mathrm{ent}= -\sum_{i=1}^m \alpha_i\log\alpha_i, \qquad
+    \mathcal{L}= \mathcal{L}_\mathrm{rec} + \lambda\,\mathcal{L}_\mathrm{ent}.
+\]
+
+\subsection{Betti Numbers}
+
+\begin{definition}[Overlap weights]\label{def:weights}
+    For charts $i,j$ define
+    \[
+        w_{ij} \;=\; \mathbb{E}_{x\sim\mathcal{D}}\bigl[\min\!\bigl(\alpha_i(x),\alpha_j(x)\bigr)\bigr]\in[0,1].
+    \]
+\end{definition}
+
+\begin{definition}[Nerve complex]\label{def:nerve}
+    Fix $\tau\in(0,1)$.  
+    The (weighted) nerve $\mathcal{N}_\tau$ has
+    \begin{itemize}
+        \item vertices $[m]$,
+        \item an edge $(i,j)$ when $w_{ij}>\tau$,
+        \item a triangle $(i,j,k)$ when all three of its edges are present.
+    \end{itemize}
+    We truncate at $2$-simplices (\(\dim\mathcal{N}_\tau\le 2\)).
+\end{definition}
+
+During training we maintain the matrix $W=(w_{ij})$ and use it to build $\mathcal{N}_\tau$.
+
+Enumerate vertices, edges, and triangles arbitrarily.  
+Let $\mathcal{E}$ be the edge list and $\mathcal{F}$ the triangle list.
+
+\begin{definition}[Boundary operators]\label{def:boundop}
+    \[
+        B_1 \in \{-1,0,1\}^{|\mathcal{E}|\times m}, \qquad 
+        (B_1)_{(i,j),i}=-1,\; (B_1)_{(i,j),j}=+1;
+    \]
+    \[
+        B_2 \in \{-1,0,1\}^{|\mathcal{F}|\times |\mathcal{E}|},
+    \]
+    where $(B_2)_{(i,j,k),(j,k)} = +1$, $(B_2)_{(i,j,k),(i,k)}=-1$, $(B_2)_{(i,j,k),(i,j)}=+1$ for the orientation $i<j<k$, and $0$ otherwise.
+\end{definition}
+
+\begin{definition}[Hodge Laplacians]\label{def:hodgelap}
+    \[
+        \Delta_0 = B_1^{\top} B_1, 
+        \qquad
+        \Delta_1 = B_1 B_1^{\top} \;+\; B_2^{\top} B_2.
+    \]
+    The multiplicity of the zero eigenvalue of $\Delta_k$ equals the $k$-th Betti number $b_k$ \cite{eckmann_1944_harmonische,derham_1936_relations}.
+\end{definition}
