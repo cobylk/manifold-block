@@ -10,7 +10,7 @@ import seaborn as sns
 
 
 class BettiEstimator:
-    def __init__(self, num_charts: int, tau: float = 0.035):
+    def __init__(self, num_charts: int, tau: float = 0.5):
         self.num_charts = num_charts
         self.tau = tau
         self.overlap_weights = torch.zeros((num_charts, num_charts))
@@ -420,6 +420,54 @@ class BettiEstimator:
         plt.show()
         
         return fig
+    
+    def visualize_chart_topology(self, model, alpha: torch.Tensor, save_path: str = "chart_topology.png"):
+        """Visualize the topographic organization of charts"""
+        grid_size = model.chart_grid_size
+        positions = model.chart_positions
+        
+        # Create grid visualization
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        
+        # Plot 1: Chart usage in grid layout
+        chart_usage = alpha.mean(dim=0).numpy()
+        usage_grid = np.zeros((grid_size, grid_size))
+        
+        for i in range(model.num_charts):
+            row, col = positions[i].int().tolist()
+            if row < grid_size and col < grid_size:
+                usage_grid[row, col] = chart_usage[i]
+        
+        im1 = ax1.imshow(usage_grid, cmap='viridis', interpolation='nearest')
+        ax1.set_title('Chart Usage (Topographic Layout)')
+        ax1.set_xlabel('Grid Column')
+        ax1.set_ylabel('Grid Row')
+        
+        # Add text annotations
+        for i in range(model.num_charts):
+            row, col = positions[i].int().tolist()
+            if row < grid_size and col < grid_size:
+                ax1.text(col, row, f'{i}', ha='center', va='center', 
+                        color='white' if chart_usage[i] < chart_usage.max()/2 else 'black',
+                        fontsize=8, weight='bold')
+        
+        plt.colorbar(im1, ax=ax1, shrink=0.8)
+        
+        # Plot 2: Spatial distances between charts
+        spatial_distances = torch.cdist(positions, positions).numpy()
+        im2 = ax2.imshow(spatial_distances, cmap='plasma', interpolation='nearest')
+        ax2.set_title('Spatial Distances Between Charts')
+        ax2.set_xlabel('Chart Index')
+        ax2.set_ylabel('Chart Index')
+        plt.colorbar(im2, ax=ax2, shrink=0.8)
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.show()
+        
+        print(f"Chart grid size: {grid_size}x{grid_size}")
+        print(f"Active charts: {(chart_usage > 0.01).sum()}/{model.num_charts}")
+        print(f"Chart usage range: [{chart_usage.min():.4f}, {chart_usage.max():.4f}]")
 
 
 class AtlasAutoencoder(nn.Module):
@@ -428,6 +476,10 @@ class AtlasAutoencoder(nn.Module):
         self.input_dim = input_dim
         self.latent_dim = latent_dim
         self.num_charts = num_charts
+        
+        # Create 2D spatial layout for charts (for TopoLoss)
+        self.chart_grid_size = int(np.ceil(np.sqrt(num_charts)))
+        self.chart_positions = self._create_chart_positions()
         
         # Gating network g: R^D -> R^m
         self.gating = nn.Sequential(
@@ -457,7 +509,54 @@ class AtlasAutoencoder(nn.Module):
         # Betti number estimator
         self.betti_estimator = BettiEstimator(num_charts)
     
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _create_chart_positions(self):
+        """Create 2D grid positions for charts (for TopoLoss)"""
+        positions = []
+        for i in range(self.num_charts):
+            row = i // self.chart_grid_size
+            col = i % self.chart_grid_size
+            positions.append([row, col])
+        return torch.tensor(positions, dtype=torch.float32)
+    
+    def compute_topo_loss(self, logits: torch.Tensor, sigma: float = 1.0) -> torch.Tensor:
+        """
+        Compute TopoLoss on gating network logits to encourage spatial organization.
+        
+        Args:
+            logits: [batch, num_charts] - raw gating network outputs
+            sigma: spatial kernel width for distance weighting
+        
+        Returns:
+            TopoLoss value encouraging nearby charts to have similar activations
+        """
+        batch_size = logits.shape[0]
+        
+        # Compute pairwise distances between chart positions
+        positions = self.chart_positions.to(logits.device)
+        pos_diffs = positions.unsqueeze(0) - positions.unsqueeze(1)  # [num_charts, num_charts, 2]
+        spatial_distances = torch.norm(pos_diffs, dim=2)  # [num_charts, num_charts]
+        
+        # Gaussian spatial kernel - closer charts should have more similar activations
+        spatial_weights = torch.exp(-spatial_distances**2 / (2 * sigma**2))
+        
+        # For each sample in batch, compute weighted activation differences
+        topo_loss = 0.0
+        for b in range(batch_size):
+            logits_b = logits[b]  # [num_charts]
+            
+            # Compute pairwise differences in activations
+            activation_diffs = (logits_b.unsqueeze(0) - logits_b.unsqueeze(1))**2  # [num_charts, num_charts]
+            
+            # Weight by spatial proximity - penalize differences between nearby charts
+            weighted_diffs = spatial_weights * activation_diffs
+            
+            # Sum over all chart pairs (exclude diagonal)
+            mask = torch.eye(self.num_charts, device=logits.device) == 0
+            topo_loss += weighted_diffs[mask].sum()
+        
+        return topo_loss / batch_size
+    
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = x.shape[0]
         
         # Compute soft chart weights α_i = softmax(g(x))
@@ -476,7 +575,7 @@ class AtlasAutoencoder(nn.Module):
         alpha_expanded = alpha.unsqueeze(1)  # [batch, 1, num_charts]
         x_hat = torch.sum(x_hat_stack * alpha_expanded, dim=2)  # [batch, input_dim]
         
-        return x_hat, alpha
+        return x_hat, alpha, logits
     
     def get_betti_numbers(self, alpha: torch.Tensor) -> Tuple[int, int]:
         """Estimate Betti numbers from current chart activations"""
@@ -497,19 +596,22 @@ def generate_torus_data(n_samples: int = 10000, R: float = 2.0, r: float = 1.0) 
     return torch.stack([x, y, z], dim=1)
 
 
-def compute_loss(x_hat: torch.Tensor, x: torch.Tensor, alpha: torch.Tensor, 
-                 lambda_ent: float = -0.5) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute reconstruction and entropy losses."""
+def compute_loss(model, x_hat: torch.Tensor, x: torch.Tensor, alpha: torch.Tensor, logits: torch.Tensor,
+                 lambda_ent: float = -0.5, lambda_topo: float = 0.01) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute reconstruction, entropy, and topographic losses."""
     # Reconstruction loss
     loss_rec = F.mse_loss(x_hat, x)
     
     # Entropy regularization: -Σ α_i log α_i
     loss_ent = -torch.sum(alpha * torch.log(alpha + 1e-8), dim=1).mean()
     
-    # Total loss
-    loss_total = loss_rec + lambda_ent * loss_ent
+    # TopoLoss on gating network output
+    loss_topo = model.compute_topo_loss(logits)
     
-    return loss_total, loss_rec, loss_ent
+    # Total loss
+    loss_total = loss_rec + lambda_ent * loss_ent + lambda_topo * loss_topo
+    
+    return loss_total, loss_rec, loss_ent, loss_topo
 
 
 def train_atlas_autoencoder():
@@ -528,8 +630,8 @@ def train_atlas_autoencoder():
     for epoch in range(1001):
         optimizer.zero_grad()
         
-        x_hat, alpha = model(train_data)
-        loss_total, loss_rec, loss_ent = compute_loss(x_hat, train_data, alpha)
+        x_hat, alpha, logits = model(train_data)
+        loss_total, loss_rec, loss_ent, loss_topo = compute_loss(model, x_hat, train_data, alpha, logits)
         
         loss_total.backward()
         optimizer.step()
@@ -539,7 +641,7 @@ def train_atlas_autoencoder():
             with torch.no_grad():
                 debug_flag = epoch == 11000  # Debug on final epoch
                 b_0, b_1 = model.betti_estimator.estimate_betti_numbers(alpha.cpu(), debug=debug_flag)
-            print(f"Epoch {epoch}: Total={loss_total:.4f}, Rec={loss_rec:.4f}, Ent={loss_ent:.4f}, b₀={b_0}, b₁={b_1}")
+            print(f"Epoch {epoch}: Total={loss_total:.4f}, Rec={loss_rec:.4f}, Ent={loss_ent:.4f}, Topo={loss_topo:.4f}, b₀={b_0}, b₁={b_1}")
     
     return model, train_data
 
@@ -552,12 +654,12 @@ if __name__ == "__main__":
     with torch.no_grad():
         # Use a subset for reconstruction test
         test_data = data[:1000]
-        x_hat, alpha = model(test_data)
+        x_hat, alpha, _ = model(test_data)
         rec_error = F.mse_loss(x_hat, test_data)
         print(f"Final reconstruction error: {rec_error:.6f}")
         
         # Get alpha for full dataset for visualization
-        _, alpha_full = model(data)
+        _, alpha_full, _ = model(data)
         
         # Show chart usage
         chart_usage = alpha_full.mean(dim=0)
@@ -573,9 +675,13 @@ if __name__ == "__main__":
         
         # Visualize reconstruction quality
         print("\nGenerating reconstruction comparison...")
-        x_recon_full, _ = model(data)
+        x_recon_full, _, _ = model(data)
         error_mag = model.betti_estimator.visualize_reconstruction_3d(data.cpu(), x_recon_full.cpu())
         
         # Visualize chart latent spaces
         print("\nGenerating chart latent space visualizations...")
-        model.betti_estimator.visualize_chart_latents(model, data.cpu(), alpha_full.cpu()) 
+        model.betti_estimator.visualize_chart_latents(model, data.cpu(), alpha_full.cpu())
+        
+        # Visualize topographic organization
+        print("\nGenerating chart topology visualization...")
+        model.betti_estimator.visualize_chart_topology(model, alpha_full.cpu()) 
